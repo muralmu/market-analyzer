@@ -5,4 +5,3 @@ numpy>=1.26.0
 plotly>=5.20.0
 requests>=2.31.0
 streamlit-searchbox>=0.1.9
-curl_cffi>=0.6.0
