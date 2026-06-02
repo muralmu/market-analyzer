@@ -1,157 +1,36 @@
 """
-Analysis engine for stocks (US + Indian) and crypto.
-Calls Yahoo Finance raw API directly (bypasses yfinance rate limiting).
-CoinGecko for crypto.
+Analysis engine — Financial Modeling Prep (stocks) + CoinGecko (crypto).
+No Yahoo Finance dependency.
 """
 
 import requests
 import pandas as pd
 import numpy as np
 import time
-import yfinance as yf
-from datetime import datetime
+import os
 
 # ---------------------------------------------------------------------------
-# Session with browser-like headers
+# API key — from Streamlit secrets or env var
 # ---------------------------------------------------------------------------
+
+def _get_fmp_key() -> str:
+    try:
+        import streamlit as st
+        return st.secrets["FMP_API_KEY"]
+    except Exception:
+        return os.environ.get("FMP_API_KEY", "")
+
+
+FMP_BASE  = "https://financialmodelingprep.com/api/v3"   # legacy (not used)
+FMP_STABLE = "https://financialmodelingprep.com/stable"   # new free endpoints
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 _SESSION = requests.Session()
 _SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0.0.0 Safari/537.36",
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
 })
-
-# ---------------------------------------------------------------------------
-# Yahoo Finance direct API helpers
-# ---------------------------------------------------------------------------
-
-_YF_CRUMB = None
-_YF_COOKIES = None
-
-def _get_crumb():
-    """Fetch Yahoo Finance crumb + cookies (needed for quoteSummary API)."""
-    global _YF_CRUMB, _YF_COOKIES
-    if _YF_CRUMB:
-        return _YF_CRUMB, _YF_COOKIES
-    try:
-        r = _SESSION.get(
-            "https://query1.finance.yahoo.com/v1/test/getcrumb",
-            timeout=10
-        )
-        if r.status_code == 200 and r.text.strip():
-            _YF_CRUMB = r.text.strip()
-            _YF_COOKIES = r.cookies
-            return _YF_CRUMB, _YF_COOKIES
-    except Exception:
-        pass
-    return None, None
-
-
-def _fetch_chart(ticker: str, period: str = "1y", interval: str = "1d") -> pd.Series | None:
-    """Fetch OHLCV from Yahoo Finance v8 chart API. Returns close price Series."""
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {"interval": interval, "range": period, "includePrePost": "false"}
-    try:
-        r = _SESSION.get(url, params=params, timeout=15)
-        if r.status_code == 429:
-            time.sleep(3)
-            r = _SESSION.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        result = data.get("chart", {}).get("result", [])
-        if not result:
-            return None
-        closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-        timestamps = result[0].get("timestamp", [])
-        if not closes or not timestamps:
-            return None
-        idx = pd.to_datetime(timestamps, unit="s")
-        s = pd.Series(closes, index=idx, dtype=float).dropna()
-        return s if len(s) >= 20 else None
-    except Exception:
-        return None
-
-
-def _fetch_quote_summary(ticker: str) -> dict:
-    """Fetch fundamental data from Yahoo Finance quoteSummary API."""
-    modules = "financialData,defaultKeyStatistics,summaryDetail,assetProfile,price"
-    crumb, cookies = _get_crumb()
-
-    for host in ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]:
-        try:
-            params = {"modules": modules, "crumb": crumb} if crumb else {"modules": modules}
-            r = _SESSION.get(
-                f"https://{host}/v10/finance/quoteSummary/{ticker}",
-                params=params,
-                cookies=cookies,
-                timeout=15,
-            )
-            if r.status_code == 429:
-                time.sleep(2)
-                continue
-            if r.status_code != 200:
-                continue
-            js = r.json().get("quoteSummary", {}).get("result", [])
-            if js:
-                merged = {}
-                for block in js:
-                    merged.update(block)
-                return merged
-        except Exception:
-            continue
-    return {}
-
-
-def _safe(d: dict, *keys, default=None):
-    """Safely extract nested dict value: d['key1']['raw'] etc."""
-    for k in keys:
-        if not isinstance(d, dict):
-            return default
-        d = d.get(k, {})
-    if isinstance(d, dict):
-        return d.get("raw", default)
-    return d if d is not None else default
-
-
-def _fetch_financials_direct(ticker: str) -> dict:
-    """Fetch quarterly + annual income statement via Yahoo Finance v10."""
-    result = {"quarterly_earnings": [], "annual_financials": []}
-
-    for path, key in [
-        (f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
-         "?modules=incomeStatementHistoryQuarterly", "incomeStatementHistoryQuarterly"),
-        (f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
-         "?modules=incomeStatementHistory", "incomeStatementHistory"),
-    ]:
-        try:
-            r = _SESSION.get(path, timeout=15)
-            if r.status_code != 200:
-                continue
-            stmts = (r.json().get("quoteSummary", {})
-                     .get("result", [{}])[0]
-                     .get(key, {})
-                     .get("incomeStatementHistory" if "Quarterly" not in key else "incomeStatementHistory", []))
-            rows = []
-            for s in stmts[:8]:
-                end = _safe(s, "endDate", "fmt") or ""
-                rev = _safe(s, "totalRevenue")
-                net = _safe(s, "netIncome")
-                eps = _safe(s, "dilutedEps") or _safe(s, "basicEps")
-                if "Quarterly" in key:
-                    rows.append({"Period": end[:7], "Revenue": rev, "Net Income": net, "EPS": eps})
-                else:
-                    rows.append({"Year": end[:4], "Revenue": rev, "Net Income": net, "EPS": eps})
-            if "Quarterly" in key:
-                result["quarterly_earnings"] = rows
-            else:
-                result["annual_financials"] = rows
-        except Exception:
-            continue
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Sector PE benchmarks
@@ -165,15 +44,80 @@ SECTOR_PE = {
 }
 
 # ---------------------------------------------------------------------------
-# Scoring
+# FMP helpers
+# ---------------------------------------------------------------------------
+
+def _fmp_stable(path: str, params: dict = {}) -> list | dict | None:
+    """Call the new FMP /stable/ endpoints."""
+    key = _get_fmp_key()
+    if not key:
+        return None
+    try:
+        r = _SESSION.get(
+            f"{FMP_STABLE}/{path}",
+            params={"apikey": key, **params},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and data.get("Error Message"):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _fmp_history(ticker: str) -> pd.Series | None:
+    """Returns daily close prices as a Series, last 365 days."""
+    data = _fmp_stable("historical-price-eod/full", {"symbol": ticker, "limit": 365})
+    if not data or not isinstance(data, list):
+        return None
+    data_sorted = sorted(data, key=lambda x: x["date"])  # oldest first
+    closes = pd.Series(
+        [d["close"] for d in data_sorted],
+        index=pd.to_datetime([d["date"] for d in data_sorted]),
+        dtype=float,
+    ).dropna()
+    return closes if len(closes) >= 20 else None
+
+
+def _fmp_quote(ticker: str) -> dict:
+    data = _fmp_stable("quote", {"symbol": ticker})
+    if data and isinstance(data, list) and data:
+        return data[0]
+    return {}
+
+
+def _fmp_profile(ticker: str) -> dict:
+    data = _fmp_stable("profile", {"symbol": ticker})
+    if data and isinstance(data, list) and data:
+        return data[0]
+    elif isinstance(data, dict):
+        return data
+    return {}
+
+
+def _fmp_income(ticker: str, period: str = "quarter", limit: int = 8) -> list:
+    data = _fmp_stable("income-statement", {"symbol": ticker, "period": period, "limit": limit})
+    return data if isinstance(data, list) else []
+
+
+def _fmp_ratios(ticker: str) -> dict:
+    data = _fmp_stable("ratios", {"symbol": ticker, "limit": 1})
+    if data and isinstance(data, list) and data:
+        return data[0]
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Technical indicators
 # ---------------------------------------------------------------------------
 
 def _rsi(prices: pd.Series, period: int = 14) -> float:
     delta = prices.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss
-    val = (100 - (100 / (1 + rs))).iloc[-1]
+    val = (100 - (100 / (1 + gain / loss))).iloc[-1]
     return round(float(val), 1) if pd.notna(val) else 50.0
 
 
@@ -181,6 +125,10 @@ def _ma(prices: pd.Series, window: int) -> float:
     val = prices.rolling(window).mean().iloc[-1]
     return round(float(val), 4) if pd.notna(val) else float(prices.iloc[-1])
 
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
 
 def _score_rsi(rsi):
     if rsi < 30:   return 20, "Oversold (bullish)"
@@ -208,16 +156,12 @@ def _score_momentum(c7, c30):
     else:           return 2,  f"Sharp decline ({avg:.1f}% avg)"
 
 
-def _score_fundamentals(qs: dict, sector: str):
+def _score_fundamentals_fmp(quote: dict, ratios: dict, km: dict, sector: str):
     score = 12
     notes = []
     sector_pe = SECTOR_PE.get(sector)
 
-    fd = qs.get("financialData", {})
-    ks = qs.get("defaultKeyStatistics", {})
-    sd = qs.get("summaryDetail", {})
-
-    pe = _safe(sd, "trailingPE") or _safe(ks, "forwardPE")
+    pe = ratios.get("priceToEarningsRatio") or km.get("peRatio")
     if pe and isinstance(pe, (int, float)) and 0 < pe < 1000:
         if sector_pe:
             ratio = pe / sector_pe
@@ -232,19 +176,14 @@ def _score_fundamentals(qs: dict, sector: str):
             elif pe < 30: score += 2; notes.append(f"P/E {pe:.1f} — fair")
             else:         score -= 4; notes.append(f"High P/E ({pe:.1f})")
 
-    eps_g = _safe(ks, "earningsQuarterlyGrowth")
-    if eps_g is not None:
-        if eps_g > 0.15:  score += 5; notes.append(f"Strong EPS growth ({eps_g*100:.0f}%)")
-        elif eps_g > 0:   score += 2; notes.append(f"Positive EPS growth ({eps_g*100:.0f}%)")
-        else:             score -= 3; notes.append(f"EPS declining ({eps_g*100:.0f}%)")
-
-    roe = _safe(fd, "returnOnEquity")
+    # ROE from key-metrics
+    roe = km.get("returnOnEquity")
     if roe is not None:
         if roe > 0.20:   score += 3; notes.append(f"Strong ROE ({roe*100:.1f}%)")
         elif roe > 0.10: score += 1; notes.append(f"ROE {roe*100:.1f}%")
         else:            score -= 2; notes.append(f"Weak ROE ({roe*100:.1f}%)")
 
-    return max(0, min(25, score)), " | ".join(notes) if notes else "Limited data"
+    return max(0, min(25, score)), " | ".join(notes) if notes else "Limited fundamental data"
 
 
 def _verdict(total):
@@ -254,15 +193,43 @@ def _verdict(total):
 
 
 # ---------------------------------------------------------------------------
-# News (via yfinance — separate, less restricted endpoint)
+# Financials formatter
+# ---------------------------------------------------------------------------
+
+def _build_quarterly(income_list: list) -> list:
+    rows = []
+    for s in income_list[:8]:
+        rows.append({
+            "Period":     s.get("date", "")[:7],
+            "Revenue":    s.get("revenue"),
+            "Net Income": s.get("netIncome") or s.get("bottomLineNetIncome"),
+            "EPS":        s.get("epsDiluted") or s.get("eps"),
+        })
+    return rows
+
+
+def _build_annual(income_list: list) -> list:
+    rows = []
+    for s in income_list[:4]:
+        rows.append({
+            "Year":       s.get("date", "")[:4],
+            "Revenue":    s.get("revenue"),
+            "Net Income": s.get("netIncome") or s.get("bottomLineNetIncome"),
+            "EPS":        s.get("epsDiluted") or s.get("eps"),
+        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# News via yfinance (separate, lighter endpoint)
 # ---------------------------------------------------------------------------
 
 def get_news(ticker: str, asset_type: str = "stock", coin_symbol: str = "") -> list[dict]:
+    import yfinance as yf
     news = []
     yf_ticker = f"{coin_symbol}-USD" if asset_type == "crypto" and coin_symbol else ticker
     try:
-        t = yf.Ticker(yf_ticker)
-        raw = t.news or []
+        raw = yf.Ticker(yf_ticker).news or []
         for item in raw[:8]:
             content = item.get("content", {})
             title = content.get("title") or item.get("title", "")
@@ -276,7 +243,8 @@ def get_news(ticker: str, asset_type: str = "stock", coin_symbol: str = "") -> l
             publisher = pub.get("displayName", "") if isinstance(pub, dict) else ""
             pub_time = content.get("pubDate", "") or ""
             if title:
-                news.append({"title": title, "url": url, "publisher": publisher, "time": pub_time})
+                news.append({"title": title, "url": url,
+                             "publisher": publisher, "time": pub_time})
     except Exception:
         pass
     return news
@@ -289,8 +257,8 @@ def get_news(ticker: str, asset_type: str = "stock", coin_symbol: str = "") -> l
 def analyze_stock(ticker: str) -> dict:
     ticker = ticker.upper().strip()
     try:
-        # 1. Price history
-        closes = _fetch_chart(ticker, period="1y", interval="1d")
+        # Price history
+        closes = _fmp_history(ticker)
         if closes is None or len(closes) < 50:
             return {"error": f"No price data found for '{ticker}'. Check the ticker symbol."}
 
@@ -303,54 +271,54 @@ def analyze_stock(ticker: str) -> dict:
         ma200 = _ma(closes, 200) if len(closes) >= 200 else ma50
         rsi_val = _rsi(closes)
 
-        # 2. Fundamental data
-        qs = _fetch_quote_summary(ticker)
-        ap = qs.get("assetProfile", {})
-        ks = qs.get("defaultKeyStatistics", {})
-        sd = qs.get("summaryDetail", {})
-        fd = qs.get("financialData", {})
-        pr = qs.get("price", {})
+        # Fundamental data
+        quote   = _fmp_quote(ticker)
+        profile = _fmp_profile(ticker)
+        ratios  = _fmp_ratios(ticker)
+        km_data = _fmp_stable("key-metrics", {"symbol": ticker, "limit": 1})
+        km      = km_data[0] if km_data and isinstance(km_data, list) else {}
 
-        name     = _safe(pr, "longName") or _safe(pr, "shortName") or ticker
-        currency = _safe(pr, "currency") or "USD"
-        sector   = ap.get("sector", "")
-        industry = ap.get("industry", "")
+        name     = profile.get("companyName") or profile.get("name") or ticker
+        currency = profile.get("currency") or "USD"
+        sector   = profile.get("sector") or ""
+        industry = profile.get("industry") or ""
 
-        # 3. Scoring
+        # Scoring
         s_rsi,  l_rsi  = _score_rsi(rsi_val)
         s_ma,   l_ma   = _score_ma_crossover(price_now, ma50, ma200)
         s_mom,  l_mom  = _score_momentum(change_7d, change_30d)
-        s_fund, l_fund = _score_fundamentals(qs, sector)
+        s_fund, l_fund = _score_fundamentals_fmp(quote, ratios, km, sector)
         total = s_rsi + s_ma + s_mom + s_fund
         verdict, color = _verdict(total)
 
-        # 4. Financials
-        fin = _fetch_financials_direct(ticker)
+        # Financials
+        q_income = _fmp_income(ticker, "quarter", 4)
+        a_income = _fmp_income(ticker, "annual",  4)
 
-        # 5. Key metrics table
+        pe      = ratios.get("priceToEarningsRatio") or km.get("peRatio")
+        pb      = ratios.get("priceToBookRatio")
+        mktcap  = km.get("marketCap") or profile.get("marketCap")
+        high_52 = profile.get("range", "").split("-")[-1].strip() if profile.get("range") else None
+        low_52  = profile.get("range", "").split("-")[0].strip()  if profile.get("range") else None
+
         fundamentals = {
-            "Market Cap":            _safe(pr, "marketCap"),
+            "Market Cap":            mktcap,
             "Sector":                sector or None,
             "Industry":              industry or None,
-            "P/E (Trailing)":        _safe(sd, "trailingPE"),
-            "P/E (Forward)":         _safe(ks, "forwardPE"),
+            "P/E (Trailing)":        pe,
             "Sector Avg P/E":        SECTOR_PE.get(sector),
-            "Price/Book":            _safe(ks, "priceToBook"),
-            "EPS (TTM)":             _safe(ks, "trailingEps"),
-            "EPS (Forward)":         _safe(ks, "forwardEps"),
-            "Revenue Growth (YoY)":  _safe(fd, "revenueGrowth"),
-            "Earnings Growth (QoQ)": _safe(ks, "earningsQuarterlyGrowth"),
-            "Profit Margin":         _safe(fd, "profitMargins"),
-            "Operating Margin":      _safe(fd, "operatingMargins"),
-            "ROE":                   _safe(fd, "returnOnEquity"),
-            "ROA":                   _safe(fd, "returnOnAssets"),
-            "Debt/Equity":           _safe(ks, "debtToEquity"),
-            "Current Ratio":         _safe(fd, "currentRatio"),
-            "Dividend Yield":        _safe(sd, "dividendYield"),
-            "52w High":              _safe(sd, "fiftyTwoWeekHigh"),
-            "52w Low":               _safe(sd, "fiftyTwoWeekLow"),
-            "Beta":                  _safe(sd, "beta"),
-            "Avg Volume":            _safe(sd, "averageVolume"),
+            "Price/Book":            pb,
+            "EPS (TTM)":             ratios.get("netIncomePerShare") or km.get("earningsYield"),
+            "Profit Margin":         ratios.get("netProfitMargin"),
+            "Operating Margin":      ratios.get("operatingProfitMargin"),
+            "ROE":                   km.get("returnOnEquity") or ratios.get("returnOnEquity"),
+            "ROA":                   km.get("returnOnAssets") or ratios.get("returnOnAssets"),
+            "Debt/Equity":           ratios.get("debtToEquityRatio"),
+            "Current Ratio":         ratios.get("currentRatio"),
+            "Dividend Yield":        ratios.get("dividendYield"),
+            "52w Range":             profile.get("range"),
+            "Beta":                  profile.get("beta"),
+            "Avg Volume":            profile.get("volAvg"),
         }
 
         news = get_news(ticker, "stock")
@@ -368,8 +336,8 @@ def analyze_stock(ticker: str) -> dict:
                 "Fundamentals": {"score": s_fund, "max": 25, "label": l_fund},
             },
             "fundamentals": fundamentals,
-            "quarterly_earnings": fin["quarterly_earnings"],
-            "annual_financials":  fin["annual_financials"],
+            "quarterly_earnings": _build_quarterly(q_income),
+            "annual_financials":  _build_annual(a_income),
             "news": news,
         }
     except Exception as e:
@@ -377,11 +345,8 @@ def analyze_stock(ticker: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Crypto analysis via CoinGecko
+# Crypto — CoinGecko (no key needed, reliable)
 # ---------------------------------------------------------------------------
-
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-
 
 def _resolve_coin_id(query: str) -> str | None:
     q = query.lower().strip()
@@ -434,8 +399,7 @@ def analyze_crypto(query: str) -> dict:
             params={"vs_currency": "usd", "days": "90"}, timeout=15,
         )
         ohlc_r.raise_for_status()
-        ohlc   = ohlc_r.json()
-        closes = pd.Series([row[4] for row in ohlc])
+        closes = pd.Series([row[4] for row in ohlc_r.json()])
 
         rsi_val = _rsi(closes) if len(closes) >= 15 else 50.0
         ma50    = _ma(closes, 50) if len(closes) >= 50 else float(closes.mean())
@@ -469,22 +433,22 @@ def analyze_crypto(query: str) -> dict:
                 "Market Cap Rank": {"score": s_rank, "max": 25, "label": l_rank},
             },
             "fundamentals": {
-                "Market Cap":        market_cap,
-                "Market Cap Rank":   market_cap_rank,
-                "24h Volume":        volume_24h,
-                "Volume/Mkt Cap":    round(volume_24h / market_cap, 4) if market_cap and volume_24h else None,
+                "Market Cap":         market_cap,
+                "Market Cap Rank":    market_cap_rank,
+                "24h Volume":         volume_24h,
+                "Volume/Mkt Cap":     round(volume_24h / market_cap, 4) if market_cap and volume_24h else None,
                 "Circulating Supply": circulating_supply,
-                "Max Supply":        max_supply,
-                "Supply Used":       f"{circulating_supply/max_supply*100:.1f}%" if max_supply and circulating_supply else "Unlimited",
-                "ATH":               ath,
-                "ATH Date":          ath_date[:10] if ath_date else None,
-                "ATH Drawdown":      f"{ath_drawdown:.1f}%" if ath_drawdown is not None else None,
-                "ATL":               atl,
-                "24h Change":        f"{change_24h:+.2f}%",
-                "7d Change":         f"{change_7d:+.2f}%",
-                "30d Change":        f"{change_30d:+.2f}%",
-                "1y Change":         f"{change_1y:+.2f}%",
-                "Description":       (data.get("description", {}).get("en", "") or "")[:300] or None,
+                "Max Supply":         max_supply,
+                "Supply Used":        f"{circulating_supply/max_supply*100:.1f}%" if max_supply and circulating_supply else "Unlimited",
+                "ATH":                ath,
+                "ATH Date":           ath_date[:10] if ath_date else None,
+                "ATH Drawdown":       f"{ath_drawdown:.1f}%" if ath_drawdown is not None else None,
+                "ATL":                atl,
+                "24h Change":         f"{change_24h:+.2f}%",
+                "7d Change":          f"{change_7d:+.2f}%",
+                "30d Change":         f"{change_30d:+.2f}%",
+                "1y Change":          f"{change_1y:+.2f}%",
+                "Description":        (data.get("description", {}).get("en", "") or "")[:300] or None,
             },
             "quarterly_earnings": [], "annual_financials": [],
             "news": news,
