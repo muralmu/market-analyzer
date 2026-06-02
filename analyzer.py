@@ -68,17 +68,31 @@ def _fmp_stable(path: str, params: dict = {}) -> list | dict | None:
 
 
 def _fmp_history(ticker: str) -> pd.Series | None:
-    """Returns daily close prices as a Series, last 365 days."""
+    """Returns daily close prices as a Series, last 365 days.
+    Tries FMP first, falls back to yfinance for tickers not in FMP free tier."""
     data = _fmp_stable("historical-price-eod/full", {"symbol": ticker, "limit": 365})
-    if not data or not isinstance(data, list):
-        return None
-    data_sorted = sorted(data, key=lambda x: x["date"])  # oldest first
-    closes = pd.Series(
-        [d["close"] for d in data_sorted],
-        index=pd.to_datetime([d["date"] for d in data_sorted]),
-        dtype=float,
-    ).dropna()
-    return closes if len(closes) >= 20 else None
+    if data and isinstance(data, list) and len(data) >= 20:
+        data_sorted = sorted(data, key=lambda x: x["date"])
+        closes = pd.Series(
+            [d["close"] for d in data_sorted],
+            index=pd.to_datetime([d["date"] for d in data_sorted]),
+            dtype=float,
+        ).dropna()
+        if len(closes) >= 20:
+            return closes
+
+    # Fallback: yfinance (works for less popular tickers not in FMP free tier)
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(period="1y", auto_adjust=True)
+        if not hist.empty and len(hist) >= 20:
+            closes = hist["Close"].dropna()
+            if isinstance(closes, pd.DataFrame):
+                closes = closes.iloc[:, 0]
+            return closes
+    except Exception:
+        pass
+    return None
 
 
 def _fmp_quote(ticker: str) -> dict:
@@ -260,7 +274,9 @@ def analyze_stock(ticker: str) -> dict:
         # Price history
         closes = _fmp_history(ticker)
         if closes is None or len(closes) < 50:
-            return {"error": f"No price data found for '{ticker}'. Check the ticker symbol."}
+            return {"error": f"No price data found for '{ticker}'. "
+                             f"Check the ticker symbol, or this stock may not be supported on the free data tier. "
+                             f"Try major US stocks (AAPL, MSFT, TSLA) or add '.NS' for Indian stocks (RELIANCE.NS)."}
 
         price_now  = float(closes.iloc[-1])
         price_7d   = float(closes.iloc[-6])  if len(closes) >= 6  else price_now
