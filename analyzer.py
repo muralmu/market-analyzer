@@ -5,9 +5,32 @@ Returns a scored analysis with Buy / Hold / Sell verdict.
 
 import yfinance as yf
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime
 import pandas as pd
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Shared session with headers + retry — avoids rate limiting on cloud IPs
+# ---------------------------------------------------------------------------
+
+def _make_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    retry = Retry(total=3, backoff_factor=1,
+                  status_forcelist=[429, 500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+_SESSION = _make_session()
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +267,7 @@ def get_news(ticker: str, asset_type: str = "stock", coin_symbol: str = "") -> l
         yf_ticker = f"{coin_symbol}-USD" if coin_symbol else f"{ticker}-USD"
 
     try:
-        t = yf.Ticker(yf_ticker)
+        t = yf.Ticker(yf_ticker, session=_SESSION)
         raw = t.news or []
         for item in raw[:8]:
             content = item.get("content", {})
@@ -278,7 +301,7 @@ def get_news(ticker: str, asset_type: str = "stock", coin_symbol: str = "") -> l
 def analyze_stock(ticker: str) -> dict:
     ticker = ticker.upper().strip()
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, session=_SESSION)
         info = t.info
 
         name = info.get("longName") or info.get("shortName") or ticker
@@ -377,7 +400,7 @@ COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 def _resolve_coin_id(query: str) -> str | None:
     q = query.lower().strip()
-    r = requests.get(f"{COINGECKO_BASE}/search", params={"query": q}, timeout=10)
+    r = _SESSION.get(f"{COINGECKO_BASE}/search", params={"query": q}, timeout=10)
     r.raise_for_status()
     coins = r.json().get("coins", [])
     if not coins:
@@ -394,7 +417,7 @@ def analyze_crypto(query: str) -> dict:
         if not coin_id:
             return {"error": f"Could not find crypto '{query}'. Try the full name (e.g. bitcoin) or symbol (e.g. BTC)."}
 
-        r = requests.get(
+        r = _SESSION.get(
             f"{COINGECKO_BASE}/coins/{coin_id}",
             params={"localization": "false", "tickers": "false", "community_data": "true", "developer_data": "false"},
             timeout=15,
@@ -423,7 +446,7 @@ def analyze_crypto(query: str) -> dict:
 
         ath_drawdown = ((price - ath) / ath * 100) if ath else None
 
-        ohlc_r = requests.get(
+        ohlc_r = _SESSION.get(
             f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
             params={"vs_currency": "usd", "days": "90"},
             timeout=15,

@@ -328,8 +328,12 @@ if analyse_btn:
         ticker = _extract_ticker(raw_input)
         asset_type = "crypto" if _is_crypto(raw_input) else "auto"
 
+        @st.cache_data(ttl=300, show_spinner=False)
+        def _cached_analyze(t, at):
+            return analyze(t, at)
+
         with st.spinner(f"Fetching data for **{ticker}**…"):
-            result = analyze(ticker, asset_type)
+            result = _cached_analyze(ticker, asset_type)
 
         if "error" in result:
             st.error(f"**Error:** {result['error']}")
