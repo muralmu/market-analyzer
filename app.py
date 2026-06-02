@@ -346,19 +346,19 @@ if analyse_btn:
             with left:
                 st.subheader(f"{result['name']} ({result['ticker']})")
                 st.metric("Price", fmt_price(result["price"], currency))
+
+                def pct(val): return f"{val:+.1f}%"
+
                 if result["type"] == "crypto":
-                    c1, c2 = st.columns(2)
-                    c1.metric("24h", f"{result.get('change_24h', 0):+.2f}%")
-                    c2.metric("7d", f"{result.get('change_7d', 0):+.2f}%")
-                    c3, c4 = st.columns(2)
-                    c3.metric("30d", f"{result.get('change_30d', 0):+.2f}%")
-                    c4.metric("1y", f"{result.get('change_1y', 0):+.2f}%")
+                    st.metric("24h Change", pct(result.get("change_24h", 0)))
+                    st.metric("7d Change",  pct(result.get("change_7d",  0)))
+                    st.metric("30d Change", pct(result.get("change_30d", 0)))
+                    st.metric("1y Change",  pct(result.get("change_1y",  0)))
                 else:
-                    c1, c2 = st.columns(2)
-                    c1.metric("7d", f"{result.get('change_7d', 0):+.2f}%")
-                    c2.metric("30d", f"{result.get('change_30d', 0):+.2f}%")
+                    st.metric("7d Change",  pct(result.get("change_7d",  0)))
+                    st.metric("30d Change", pct(result.get("change_30d", 0)))
                 st.metric("RSI (14)", result["rsi"])
-                st.metric("MA50", fmt_price(result["ma50"], currency))
+                st.metric("MA50",  fmt_price(result["ma50"], currency))
                 if result.get("ma200"):
                     st.metric("MA200", fmt_price(result["ma200"], currency))
 
@@ -375,7 +375,7 @@ if analyse_btn:
             # ── Fundamentals ──
             st.divider()
             st.markdown("### 📋 Fundamentals")
-            fund = {k: v for k, v in result.get("fundamentals", {}).items() if v is not None}
+            fund = result.get("fundamentals", {})
 
             # Description (crypto)
             desc = fund.pop("Description", None)
@@ -399,8 +399,9 @@ if analyse_btn:
                         unsafe_allow_html=True,
                     )
 
-            # Fundamentals table in two columns
-            fund_items = [(k, fmt_val(k, v, currency)) for k, v in fund.items()]
+            # Fundamentals table — always show all rows, — for missing
+            fund_items = [(k, fmt_val(k, v, currency) if v is not None else "—")
+                          for k, v in fund.items() if k != "Description"]
             half = len(fund_items) // 2 + len(fund_items) % 2
             fc1, fc2 = st.columns(2)
             with fc1:
