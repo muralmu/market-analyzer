@@ -5,32 +5,23 @@ Returns a scored analysis with Buy / Hold / Sell verdict.
 
 import yfinance as yf
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from datetime import datetime
 import pandas as pd
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
-# Shared session with headers + retry — avoids rate limiting on cloud IPs
+# curl_cffi session — impersonates Chrome to bypass Yahoo Finance bot blocking
+# Falls back to plain requests if curl_cffi not available
 # ---------------------------------------------------------------------------
 
-def _make_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    })
-    retry = Retry(total=3, backoff_factor=1,
-                  status_forcelist=[429, 500, 502, 503, 504])
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    return session
-
-_SESSION = _make_session()
+try:
+    from curl_cffi import requests as curl_requests
+    _SESSION = curl_requests.Session(impersonate="chrome110")
+    _CURL_AVAILABLE = True
+except ImportError:
+    _SESSION = requests.Session()
+    _SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+    _CURL_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
