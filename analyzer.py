@@ -207,6 +207,55 @@ def _verdict(total):
 
 
 # ---------------------------------------------------------------------------
+# yfinance fundamentals fallback
+# ---------------------------------------------------------------------------
+
+def _yf_fundamentals(ticker: str) -> dict:
+    """Get fundamental data from yfinance when FMP free tier lacks it."""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info or {}
+        q_stmts, a_stmts = [], []
+
+        t = yf.Ticker(ticker)
+        try:
+            qi = t.quarterly_income_stmt
+            if qi is not None and not qi.empty:
+                for col in list(qi.columns)[:4]:
+                    period = col.strftime("%Y-%m") if hasattr(col, "strftime") else str(col)[:7]
+                    q_stmts.append({
+                        "date": period,
+                        "revenue":    float(qi.loc["Total Revenue", col])   if "Total Revenue" in qi.index else None,
+                        "netIncome":  float(qi.loc["Net Income", col])       if "Net Income"    in qi.index else None,
+                        "epsDiluted": float(qi.loc["Diluted EPS", col])      if "Diluted EPS"   in qi.index else None,
+                    })
+        except Exception:
+            pass
+
+        try:
+            ai = t.income_stmt
+            if ai is not None and not ai.empty:
+                for col in list(ai.columns)[:4]:
+                    year = col.strftime("%Y") if hasattr(col, "strftime") else str(col)[:4]
+                    a_stmts.append({
+                        "date": year,
+                        "revenue":    float(ai.loc["Total Revenue", col])   if "Total Revenue" in ai.index else None,
+                        "netIncome":  float(ai.loc["Net Income", col])       if "Net Income"    in ai.index else None,
+                        "epsDiluted": float(ai.loc["Diluted EPS", col])      if "Diluted EPS"   in ai.index else None,
+                    })
+        except Exception:
+            pass
+
+        return {
+            "info": info,
+            "quarterly": q_stmts,
+            "annual": a_stmts,
+        }
+    except Exception:
+        return {"info": {}, "quarterly": [], "annual": []}
+
+
+# ---------------------------------------------------------------------------
 # Financials formatter
 # ---------------------------------------------------------------------------
 
@@ -287,54 +336,82 @@ def analyze_stock(ticker: str) -> dict:
         ma200 = _ma(closes, 200) if len(closes) >= 200 else ma50
         rsi_val = _rsi(closes)
 
-        # Fundamental data
+        # Fundamental data — FMP first, yfinance fills gaps
         quote   = _fmp_quote(ticker)
         profile = _fmp_profile(ticker)
         ratios  = _fmp_ratios(ticker)
         km_data = _fmp_stable("key-metrics", {"symbol": ticker, "limit": 1})
         km      = km_data[0] if km_data and isinstance(km_data, list) else {}
 
-        name     = profile.get("companyName") or profile.get("name") or ticker
-        currency = profile.get("currency") or "USD"
-        sector   = profile.get("sector") or ""
-        industry = profile.get("industry") or ""
+        # Detect if FMP has limited data for this ticker → fetch yfinance supplement
+        fmp_has_ratios = bool(ratios)
+        yf_data = _yf_fundamentals(ticker) if not fmp_has_ratios else {"info": {}, "quarterly": [], "annual": []}
+        yf_info = yf_data["info"]
+
+        # Merge: FMP wins where available, yfinance fills gaps
+        def _pick(*vals):
+            """Return first non-None, non-zero, non-empty value."""
+            for v in vals:
+                if v is not None and v != "" and v != 0:
+                    return v
+            return None
+
+        name     = _pick(profile.get("companyName"), profile.get("name"), yf_info.get("longName"), ticker)
+        currency = _pick(profile.get("currency"), yf_info.get("currency"), "USD")
+        sector   = _pick(profile.get("sector"), yf_info.get("sector"), "")
+        industry = _pick(profile.get("industry"), yf_info.get("industry"), "")
+
+        pe  = _pick(ratios.get("priceToEarningsRatio"), km.get("peRatio"),
+                    yf_info.get("trailingPE"), yf_info.get("forwardPE"))
+        pb  = _pick(ratios.get("priceToBookRatio"), yf_info.get("priceToBook"))
+        roe = _pick(km.get("returnOnEquity"), ratios.get("returnOnEquity"), yf_info.get("returnOnEquity"))
+        roa = _pick(km.get("returnOnAssets"), ratios.get("returnOnAssets"), yf_info.get("returnOnAssets"))
+        profit_margin   = _pick(ratios.get("netProfitMargin"),      yf_info.get("profitMargins"))
+        op_margin       = _pick(ratios.get("operatingProfitMargin"), yf_info.get("operatingMargins"))
+        debt_equity     = _pick(ratios.get("debtToEquityRatio"),     yf_info.get("debtToEquity"))
+        current_ratio   = _pick(ratios.get("currentRatio"),          yf_info.get("currentRatio"))
+        div_yield       = _pick(ratios.get("dividendYield"),         yf_info.get("dividendYield"))
+        mktcap          = _pick(km.get("marketCap"), profile.get("marketCap"), yf_info.get("marketCap"))
+        beta            = _pick(profile.get("beta"), yf_info.get("beta"))
+        avg_vol         = _pick(profile.get("volAvg"), yf_info.get("averageVolume"))
+        eps             = _pick(ratios.get("netIncomePerShare"), yf_info.get("trailingEps"))
 
         # Scoring
         s_rsi,  l_rsi  = _score_rsi(rsi_val)
         s_ma,   l_ma   = _score_ma_crossover(price_now, ma50, ma200)
         s_mom,  l_mom  = _score_momentum(change_7d, change_30d)
-        s_fund, l_fund = _score_fundamentals_fmp(quote, ratios, km, sector)
+
+        # Build merged ratios dict for scorer
+        merged_ratios = {**ratios, "priceToEarningsRatio": pe, "returnOnEquity": roe}
+        merged_km     = {**km, "returnOnEquity": roe}
+        s_fund, l_fund = _score_fundamentals_fmp(quote, merged_ratios, merged_km, sector)
         total = s_rsi + s_ma + s_mom + s_fund
         verdict, color = _verdict(total)
 
-        # Financials
+        # Financials — FMP first, yfinance fallback
         q_income = _fmp_income(ticker, "quarter", 4)
         a_income = _fmp_income(ticker, "annual",  4)
-
-        pe      = ratios.get("priceToEarningsRatio") or km.get("peRatio")
-        pb      = ratios.get("priceToBookRatio")
-        mktcap  = km.get("marketCap") or profile.get("marketCap")
-        high_52 = profile.get("range", "").split("-")[-1].strip() if profile.get("range") else None
-        low_52  = profile.get("range", "").split("-")[0].strip()  if profile.get("range") else None
+        if not q_income: q_income = yf_data["quarterly"]
+        if not a_income: a_income = yf_data["annual"]
 
         fundamentals = {
-            "Market Cap":            mktcap,
-            "Sector":                sector or None,
-            "Industry":              industry or None,
-            "P/E (Trailing)":        pe,
-            "Sector Avg P/E":        SECTOR_PE.get(sector),
-            "Price/Book":            pb,
-            "EPS (TTM)":             ratios.get("netIncomePerShare") or km.get("earningsYield"),
-            "Profit Margin":         ratios.get("netProfitMargin"),
-            "Operating Margin":      ratios.get("operatingProfitMargin"),
-            "ROE":                   km.get("returnOnEquity") or ratios.get("returnOnEquity"),
-            "ROA":                   km.get("returnOnAssets") or ratios.get("returnOnAssets"),
-            "Debt/Equity":           ratios.get("debtToEquityRatio"),
-            "Current Ratio":         ratios.get("currentRatio"),
-            "Dividend Yield":        ratios.get("dividendYield"),
-            "52w Range":             profile.get("range"),
-            "Beta":                  profile.get("beta"),
-            "Avg Volume":            profile.get("volAvg"),
+            "Market Cap":        mktcap,
+            "Sector":            sector or None,
+            "Industry":          industry or None,
+            "P/E (Trailing)":    pe,
+            "Sector Avg P/E":    SECTOR_PE.get(sector),
+            "Price/Book":        pb,
+            "EPS (TTM)":         eps,
+            "Profit Margin":     profit_margin,
+            "Operating Margin":  op_margin,
+            "ROE":               roe,
+            "ROA":               roa,
+            "Debt/Equity":       debt_equity,
+            "Current Ratio":     current_ratio,
+            "Dividend Yield":    div_yield,
+            "52w Range":         profile.get("range"),
+            "Beta":              beta,
+            "Avg Volume":        avg_vol,
         }
 
         news = get_news(ticker, "stock")
